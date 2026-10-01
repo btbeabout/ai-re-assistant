@@ -20,6 +20,21 @@ GLUE_SYMBOLS = (
     "__cxa_finalize", "__gmon_start__",
 )
 
+def referenced_strings(program, fn):
+    """Strings referenced from within this function's body."""
+    strings, seen = [], set()
+    listing = program.getListing()
+    ref_mgr = program.getReferenceManager()
+    for instr in listing.getInstructions(fn.getBody(), True):
+        for ref in ref_mgr.getReferencesFrom(instr.getAddress()):
+            data = listing.getDataAt(ref.getToAddress())
+            if data is not None and data.hasStringValue():
+                s = str(data.getValue())
+                if s not in seen:
+                    seen.add(s)
+                    strings.append(s)
+    return strings
+
 def order_functions(functions):
     """Order functions callees-before-callers (bottom-up post-order DFS).
     Tolerant of recursion and mutual recursion via back-edge detection."""
@@ -69,14 +84,31 @@ def decompile(function, decomp):
     return None
 
 
-def ask_llm(code, current_name):
+def ask_llm(code, current_name, callee_ctx, strings):
     system = (
         "You are a reverse-engineering assistant. You are given decompiled C "
-        "output from Ghidra. Respond with ONLY a JSON object, no prose, no "
-        'markdown fences, of the form: '
+        "output from Ghidra, plus context about the functions it calls and the "
+        "strings it references. Use that context. Respond with ONLY a JSON "
+        "object, no prose, no markdown fences, of the form: "
         '{"name": "<snake_case_identifier>", "summary": "<one paragraph>"}'
     )
-    user = f"Function currently named {current_name}:\n\n{code}"
+
+    parts = []
+    if callee_ctx:
+        parts.append("Functions this one calls (already analyzed):")
+        for name, summary in callee_ctx:
+            parts.append(f"- {name}: {summary}")
+        parts.append("")
+    if strings:
+        parts.append("String literals referenced by this function:")
+        for s in strings:
+            parts.append(f'  - "{s}"')
+        parts.append("")
+    parts.append(f"Decompiled function (currently named {current_name}):")
+    parts.append("")
+    parts.append(code)
+    user = "\n".join(parts)
+
     payload = {
         "model": MODEL,
         "temperature": 0.1,
@@ -108,16 +140,25 @@ def annotate(program):
           + " -> ".join(str(f.getName()) for f in functions))
 
     results = []
+    recovered = {}   # addr -> {"name", "summary"}; feeds callers their callees
     with pyghidra.transaction(program):
         for fn in functions:
             code = decompile(fn, decomp)
             if not code:
                 continue
+
+            # Callee summaries we've already recovered (available because the
+            # call-graph ordering processed callees before this caller).
+            callee_ctx = []
+            for callee in fn.getCalledFunctions(TaskMonitor.DUMMY):
+                rec = recovered.get(str(callee.getEntryPoint()))
+                if rec:
+                    callee_ctx.append((rec["name"], rec["summary"]))
+
+            strings = referenced_strings(program, fn)
+
             try:
-                if any(sym in code for sym in GLUE_SYMBOLS):
-                    print(f"[-] skipping runtime glue: {fn.getName()}")
-                    continue
-                ai = ask_llm(code, fn.getName())
+                ai = ask_llm(code, fn.getName(), callee_ctx, strings)
             except Exception as e:
                 print(f"[!] {fn.getName()}: {e}")
                 continue
@@ -127,15 +168,21 @@ def annotate(program):
             try:
                 fn.setName(ai["name"], SourceType.USER_DEFINED)
             except Exception:
-                pass  # DuplicateNameException etc.
+                pass
 
+            recovered[str(fn.getEntryPoint())] = {
+                "name": ai["name"], "summary": ai["summary"]}
             results.append({
                 "address":  str(fn.getEntryPoint()),
                 "old_name": old,
                 "new_name": ai["name"],
                 "summary":  ai["summary"],
             })
-            print(f"[+] {old} -> {ai['name']}")
+            extra = []
+            if callee_ctx: extra.append(f"+{len(callee_ctx)} callee ctx")
+            if strings:    extra.append(f"+{len(strings)} strings")
+            tag = f"  ({', '.join(extra)})" if extra else ""
+            print(f"[+] {old} -> {ai['name']}{tag}")
     return results
 
 
