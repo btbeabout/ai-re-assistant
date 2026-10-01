@@ -131,25 +131,59 @@ the wider LAN. The tool operates only on static decompiler output; it never
 executes the binary. Samples and Ghidra projects are kept outside the
 repository and excluded by .gitignore.
 
+## Evaluation
+
+The tool ships with an evaluation harness (ground_truth.py + eval.py) that
+measures naming quality against ground truth recovered from an unstripped copy
+of the binary (same Ghidra address frame as analysis, so the join is exact).
+
+It reports three scorers side by side, by design rather than redundancy:
+
+- Lexical (name vs name): token-set overlap. A deliberately weak baseline --
+  it scores semantically-correct names like verify -> check_password as misses,
+  which motivates the judges.
+- Judge, name vs name: a separate model (gemma3:12b, not the model that wrote
+  the names, to blunt self-preference bias) rates whether two names mean the
+  same thing.
+- Judge, name vs code: the same judge rates whether a recovered name fits the
+  function's actual decompiled behavior -- which also lets it score
+  conventional names like main that have no behavioral label to match.
+
+### Known limitation: the judge is not yet trustworthy
+
+Cross-referencing the three scorers surfaced two failure modes in the behavior
+judge, both well-documented in the LLM-as-a-judge literature:
+
+- Trivial-function shortcut: empty compiler-glue stubs are scored "match" on
+  the reasoning "name irrelevant", rewarding meaningless names.
+- Reason/verdict contradiction: a function whose rationale confirms the name
+  fits is nonetheless labelled "miss" -- sound reasoning mapped to the wrong
+  verdict.
+
+The single-shot semantic numbers are therefore reported but not yet relied on.
+The three-scorer layout is itself the mitigation: disagreement between scorers
+is how these defects became visible instead of silently inflating a headline
+number. Planned work: self-consistency (repeat each judgment and report
+agreement, so unstable verdicts are flagged) and a triviality guard for
+empty/boilerplate functions.
+
 ## Status
 
-Working: full pipeline -- decompile, filter, call-graph ordering, context
-enrichment, structured output, and persisted annotations -- against a locally
-hosted model.
+Working: full analysis pipeline -- decompile, filter, call-graph ordering,
+context enrichment, structured output, persisted annotations -- plus an
+evaluation harness with lexical and LLM-judge scorers.
 
 Roadmap:
-1. [done] Boilerplate filtering -- skip library/compiler glue and already-named
-   functions instead of spending model calls on them.
-2. [done] Call-graph-ordered analysis -- process callees before callers so
-   recovered names and summaries propagate.
-3. [done] Context enrichment -- feed each function its callees' recovered
-   summaries and referenced strings.
+1. [done] Boilerplate filtering.
+2. [done] Call-graph-ordered analysis.
+3. [done] Context enrichment (callee summaries + referenced strings).
+4. [done] Evaluation harness (lexical + name-judge + behavior-judge scorers).
 
 Next:
-- Evaluation harness: compile a binary with symbols as ground truth, strip it,
-  run the tool, and diff recovered names against the originals to measure
-  accuracy and quantify each stage's contribution.
-- Robust JSON parsing for models that wrap output in markdown fences or prose.
-- Smart context assembly: prioritize and truncate callee/string context before
-  it overflows the model's context window on large binaries.
+- Judge reliability: self-consistency across repeated judgments; triviality
+  guard; optionally feed the judge function summaries as well as code.
+- Robust JSON parsing in analyze.py for models that wrap output in fences.
+- Smart context assembly: prioritize/truncate callee+string context before it
+  overflows the model's context window on large binaries.
+- Scale evaluation to a corpus of many binaries (current N is illustrative).
 - Optional agentic/MCP fork for interactive, tool-driven investigation.
