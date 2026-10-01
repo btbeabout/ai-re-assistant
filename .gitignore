@@ -18,3 +18,6 @@ results.json
 
 # Samples (should be outside repo anyway)
 samples/
+
+# Evaluation results
+eval/*.json
