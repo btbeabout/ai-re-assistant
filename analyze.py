@@ -7,7 +7,7 @@ import pyghidra
 pyghidra.start(install_dir="/opt/ghidra")
 
 from ghidra.app.decompiler import DecompInterface
-from ghidra.util.task import ConsoleTaskMonitor
+from ghidra.util.task import ConsoleTaskMonitor, TaskMonitor
 from ghidra.program.model.symbol import SourceType
 
 LLM_URL      = "http://192.168.56.1:11434/v1/chat/completions"
@@ -19,6 +19,38 @@ GLUE_SYMBOLS = (
     "_ITM_deregisterTMCloneTable", "_ITM_registerTMCloneTable",
     "__cxa_finalize", "__gmon_start__",
 )
+
+def order_functions(functions):
+    """Order functions callees-before-callers (bottom-up post-order DFS).
+    Tolerant of recursion and mutual recursion via back-edge detection."""
+    # Key everything by entry-point address — a stable identity across the
+    # Python/Java boundary, safer than relying on Java object hashing.
+    by_addr = {str(f.getEntryPoint()): f for f in functions}
+
+    # Dependency edges, restricted to the target set. A callee that isn't in
+    # the set is already named, so it imposes no ordering constraint.
+    deps = {}
+    for addr, fn in by_addr.items():
+        called = fn.getCalledFunctions(TaskMonitor.DUMMY)
+        deps[addr] = {str(c.getEntryPoint()) for c in called
+                      if str(c.getEntryPoint()) in by_addr
+                      and str(c.getEntryPoint()) != addr}   # ignore self-recursion
+
+    ordered, visited, on_stack = [], set(), set()
+
+    def visit(addr):
+        if addr in visited or addr in on_stack:
+            return                       # done, or a cycle back-edge: skip
+        on_stack.add(addr)
+        for dep in deps[addr]:
+            visit(dep)                   # callees first
+        on_stack.discard(addr)
+        visited.add(addr)
+        ordered.append(by_addr[addr])    # then this function
+
+    for addr in by_addr:
+        visit(addr)
+    return ordered
 
 def is_worth_analyzing(fn):
     if fn.isThunk() or fn.isExternal():
@@ -66,9 +98,14 @@ def annotate(program):
     fm = program.getFunctionManager()
     all_funcs = list(fm.getFunctions(True))
     functions = [f for f in all_funcs if is_worth_analyzing(f)]
+    
     skipped = len(all_funcs) - len(functions)
     print(f"[*] {len(functions)} functions to analyze, "
           f"{skipped} skipped as already-named/boilerplate")
+    
+    functions = order_functions(functions)
+    print("[*] Order (callees first): "
+          + " -> ".join(str(f.getName()) for f in functions))
 
     results = []
     with pyghidra.transaction(program):
