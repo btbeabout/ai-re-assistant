@@ -1,4 +1,4 @@
-# AI-assisted RE doodad
+# ai-re-assistant
 
 A headless PyGhidra tool that uses a locally-hosted LLM to recover function
 names and summaries from stripped binaries, writing the results back into a
@@ -6,13 +6,33 @@ persistent Ghidra project.
 
 ## How it works
 
-Ghidra decompiles each function to pseudo-C. That text is sent to a
-locally-hosted model through an OpenAI-compatible chat endpoint, which returns
-a suggested snake_case name and a one-paragraph summary. Both are written back
-into a persistent Ghidra project as a rename and a plate comment, so reopening
-the binary in the Ghidra GUI shows the recovered names and summaries inline.
-Because renames persist, functions analyzed later benefit from the recovered
-names of functions analyzed earlier.
+For each binary, the tool decompiles every function to pseudo-C, then filters
+out functions not worth a model call (thunks, external imports, already-named
+and ELF-structural functions). The remaining functions are ordered
+callees-before-callers via a post-order traversal of the call graph, so that by
+the time any function is analyzed, everything it calls has already been
+recovered. Each function's prompt is then enriched with the already-recovered
+summaries of its callees and the string literals it references, and sent to a
+locally-hosted model through an OpenAI-compatible chat endpoint. The model
+returns a suggested snake_case name and a one-paragraph summary, both written
+back into a persistent Ghidra project as a rename and a plate comment -- so
+reopening the binary in the Ghidra GUI shows the recovered names and summaries
+inline, and later functions benefit from the recovered meaning of earlier ones.
+
+## Features
+
+- Recovers function names and summaries from stripped binaries via a local LLM.
+- Persists results into a reopenable Ghidra project (renames + plate comments).
+- Skips functions that don't need a model call: thunks, external imports,
+  already-named functions (whether named by Ghidra or a prior AI pass), and
+  ELF-structural functions, so inference isn't spent on library and startup
+  scaffolding.
+- Processes functions callees-before-callers (call-graph post-order, tolerant
+  of recursion) so recovered names and summaries propagate deterministically
+  instead of depending on address layout.
+- Enriches each function's prompt with its callees' recovered summaries and its
+  referenced string literals, letting the model reason over a function's whole
+  subtree rather than in isolation.
 
 ## Prerequisites
 
@@ -111,24 +131,25 @@ the wider LAN. The tool operates only on static decompiler output; it never
 executes the binary. Samples and Ghidra projects are kept outside the
 repository and excluded by .gitignore.
 
-## Features
-
-- Recovers function names and summaries from stripped binaries via a local LLM.
-- Persists results into a reopenable Ghidra project (renames + plate comments).
-- Skips functions that don't need a model call: thunks, external imports,
-  already-named functions (whether named by Ghidra or a prior AI pass), and
-  ELF-structural functions. This avoids spending inference on library and
-  startup scaffolding, which dominates real binaries.
-
 ## Status
 
-Working: decompile -> local model -> structured output -> persisted
-annotations, with filtering to skip boilerplate and already-named functions.
+Working: full pipeline -- decompile, filter, call-graph ordering, context
+enrichment, structured output, and persisted annotations -- against a locally
+hosted model.
 
 Roadmap:
 1. [done] Boilerplate filtering -- skip library/compiler glue and already-named
    functions instead of spending model calls on them.
-2. Call-graph-ordered analysis -- process callees before callers so recovered
-   names propagate.
-3. Context enrichment -- feed each function its callees' recovered names and
-   referenced strings.
+2. [done] Call-graph-ordered analysis -- process callees before callers so
+   recovered names and summaries propagate.
+3. [done] Context enrichment -- feed each function its callees' recovered
+   summaries and referenced strings.
+
+Next:
+- Evaluation harness: compile a binary with symbols as ground truth, strip it,
+  run the tool, and diff recovered names against the originals to measure
+  accuracy and quantify each stage's contribution.
+- Robust JSON parsing for models that wrap output in markdown fences or prose.
+- Smart context assembly: prioritize and truncate callee/string context before
+  it overflows the model's context window on large binaries.
+- Optional agentic/MCP fork for interactive, tool-driven investigation.
