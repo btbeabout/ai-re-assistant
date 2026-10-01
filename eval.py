@@ -33,6 +33,16 @@ def lexical_verdict(truth_name, rec_name):
     return "miss"
 
 
+def blank_own_name(code, name):
+    """Remove the function's own ground-truth name from its decompilation so the
+    behavior judge scores the candidate against the CODE, not the leaked label.
+    Whole-word only: substrings and callees are untouched (e.g. 'main' inside
+    '__libc_start_main' is preserved; a self-recursive call is blanked too)."""
+    if not name:
+        return code
+    return re.sub(rf"\b{re.escape(name)}\b", "FUN_TARGET", code)
+
+
 def _ask_judge(system, user, temperature):
     payload = {
         "model": JUDGE_MODEL, "temperature": temperature,
@@ -79,16 +89,15 @@ def judge_behavior(rec_name, truth_code, temperature):
 
 
 def judge_consistent(judge_fn, *args):
-    """Call a judge N_JUDGE times at JUDGE_TEMP; return the majority verdict,
-    its vote count, the full distribution, and a representative reason."""
-    verdicts, reasons = [], {}
+    """Call a judge N_JUDGE times at JUDGE_TEMP; return majority verdict, its
+    count, the distribution, and the list of (verdict, reason) per sample."""
+    samples = []
     for _ in range(N_JUDGE):
         v, reason = judge_fn(*args, JUDGE_TEMP)
-        verdicts.append(v)
-        reasons.setdefault(v, reason)
-    dist = collections.Counter(verdicts)
+        samples.append((v, reason))
+    dist = collections.Counter(v for v, _ in samples)
     majority, top = dist.most_common(1)[0]
-    return majority, top, dist, reasons.get(majority, "")
+    return majority, top, dist, samples
 
 
 def rate(counts):
@@ -126,6 +135,7 @@ def main(truth_path, results_path):
     name = {"match": 0, "partial": 0, "miss": 0}
     beh  = {"match": 0, "partial": 0, "miss": 0}
     rows, name_agr, beh_agr, unstable = [], [], [], []
+    beh_reasons = []
 
     to_score = [(a, truth[a]) for a in sorted(truth) if a in recovered]
     print(f"[*] Judging {len(to_score)} functions with {JUDGE_MODEL}, "
@@ -144,8 +154,11 @@ def main(truth_path, results_path):
                 unstable.append((real, "name", nv, ndist))
 
         if code.strip():
-            bv, btop, bdist, _ = judge_consistent(judge_behavior, rec, code)
+            sanitized = blank_own_name(code, real)
+            bv, btop, bdist, bsamples = judge_consistent(
+                judge_behavior, rec, sanitized)
             tally(beh, bv); beh_agr.append(btop / N_JUDGE)
+            beh_reasons.append((real, rec, bsamples))
             if btop / N_JUDGE < 0.6:
                 unstable.append((real, "behavior", bv, bdist))
         else:
@@ -172,6 +185,12 @@ def main(truth_path, results_path):
         for real, which, maj, dist in unstable:
             print(f"  {real} [{which}]: majority '{maj}', but split — "
                   f"{fmt_dist(dist)}")
+
+    print("\n--- Behavior judge reasoning (per sample) ---")
+    for real, rec, samples in beh_reasons:
+        print(f"\n{real} -> {rec}:")
+        for v, reason in samples:
+            print(f"    {v:<8} {reason}")
 
     missing = len(truth) - len(to_score)
     if missing:
