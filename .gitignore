@@ -1,0 +1,20 @@
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
+
+# Analysis artifacts — never commit these
+results.json
+*.bin
+*.exe
+*.dll
+*.elf
+*.so
+
+# Ghidra projects (should be outside repo anyway)
+*.gpr
+*.rep/
+
+# Samples (should be outside repo anyway)
+samples/
