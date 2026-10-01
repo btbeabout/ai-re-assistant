@@ -117,6 +117,10 @@ def main(binary_path):
             results = annotate(program)
             program.save("AI annotations", pyghidra.task_monitor())
 
+    os.makedirs("results", exist_ok=True)
+    with open("results/results.json", "w") as f:
+        json.dump(results, f, indent=2)
+
     with open("results/results.json", "w") as f:
         json.dump(results, f, indent=2)
     print(f"\n[*] Saved {len(results)} annotations to the project and results.json")
