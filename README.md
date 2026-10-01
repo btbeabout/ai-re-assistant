@@ -96,7 +96,7 @@ Then run the full pass over every function in a binary:
 
 On first run this imports and analyzes the binary (slower), annotates every
 function, saves the results into a Ghidra project under ~/lab/projects/, and
-writes results.json. Re-running reuses the existing analysis.
+writes results/results.json. Re-running reuses the existing analysis.
 
 To see the annotations, open the ai-re project in the Ghidra GUI and open the
 binary; recovered names and summaries appear in the decompiler. The Ghidra GUI
@@ -111,13 +111,23 @@ the wider LAN. The tool operates only on static decompiler output; it never
 executes the binary. Samples and Ghidra projects are kept outside the
 repository and excluded by .gitignore.
 
+## Features
+
+- Recovers function names and summaries from stripped binaries via a local LLM.
+- Persists results into a reopenable Ghidra project (renames + plate comments).
+- Skips functions that don't need a model call: thunks, external imports,
+  already-named functions (whether named by Ghidra or a prior AI pass), and
+  ELF-structural functions. This avoids spending inference on library and
+  startup scaffolding, which dominates real binaries.
+
 ## Status
 
-Working: decompile -> local model -> structured output -> persisted annotations.
+Working: decompile -> local model -> structured output -> persisted
+annotations, with filtering to skip boilerplate and already-named functions.
 
 Roadmap:
-1. Boilerplate filtering -- skip libc/compiler glue instead of spending model
-   calls on it.
+1. [done] Boilerplate filtering -- skip library/compiler glue and already-named
+   functions instead of spending model calls on them.
 2. Call-graph-ordered analysis -- process callees before callers so recovered
    names propagate.
 3. Context enrichment -- feed each function its callees' recovered names and

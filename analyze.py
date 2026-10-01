@@ -15,6 +15,20 @@ MODEL        = "qwen2.5-coder:14b"
 PROJECT_DIR  = os.path.expanduser("~/Desktop/AI-Malware-RE/lab/projects")
 PROJECT_NAME = "ai-re"
 
+GLUE_SYMBOLS = (
+    "_ITM_deregisterTMCloneTable", "_ITM_registerTMCloneTable",
+    "__cxa_finalize", "__gmon_start__",
+)
+
+def is_worth_analyzing(fn):
+    if fn.isThunk() or fn.isExternal():
+        return False
+    # Only Ghidra's default FUN_<addr> names are unidentified. Anything
+    # already named — by Ghidra (entry, _DT_INIT) or a prior AI pass —
+    # we skip, so we never spend a model call re-describing known code.
+    if not str(fn.getName()).startswith("FUN_"):
+        return False
+    return True
 
 def decompile(function, decomp):
     res = decomp.decompileFunction(function, 60, ConsoleTaskMonitor())
@@ -50,8 +64,11 @@ def annotate(program):
     decomp.openProgram(program)
 
     fm = program.getFunctionManager()
-    functions = [f for f in fm.getFunctions(True)
-                 if not f.isThunk() and not f.isExternal()]
+    all_funcs = list(fm.getFunctions(True))
+    functions = [f for f in all_funcs if is_worth_analyzing(f)]
+    skipped = len(all_funcs) - len(functions)
+    print(f"[*] {len(functions)} functions to analyze, "
+          f"{skipped} skipped as already-named/boilerplate")
 
     results = []
     with pyghidra.transaction(program):
@@ -60,6 +77,9 @@ def annotate(program):
             if not code:
                 continue
             try:
+                if any(sym in code for sym in GLUE_SYMBOLS):
+                    print(f"[-] skipping runtime glue: {fn.getName()}")
+                    continue
                 ai = ask_llm(code, fn.getName())
             except Exception as e:
                 print(f"[!] {fn.getName()}: {e}")
