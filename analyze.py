@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import sys
 import requests
 import pyghidra
@@ -19,6 +20,14 @@ GLUE_SYMBOLS = (
     "_ITM_deregisterTMCloneTable", "_ITM_registerTMCloneTable",
     "__cxa_finalize", "__gmon_start__",
 )
+
+def parse_json_lenient(text):
+    """Extract the first {...} JSON object from a model response, tolerating
+    markdown fences or prose preamble around it."""
+    m = re.search(r"\{.*\}", text, re.DOTALL)
+    if not m:
+        raise ValueError(f"no JSON object in response: {text[:80]!r}")
+    return json.loads(m.group(0))
 
 def referenced_strings(program, fn):
     """Strings referenced from within this function's body."""
@@ -84,8 +93,8 @@ def decompile(function, decomp):
     return None
 
 
-def ask_llm(code, current_name, callee_ctx, strings):
-    system = (
+def ask_llm(code, current_name, callee_ctx, strings, retries=1):
+    base_system = (
         "You are a reverse-engineering assistant. You are given decompiled C "
         "output from Ghidra, plus context about the functions it calls and the "
         "strings it references. Use that context. Respond with ONLY a JSON "
@@ -109,18 +118,35 @@ def ask_llm(code, current_name, callee_ctx, strings):
     parts.append(code)
     user = "\n".join(parts)
 
-    payload = {
-        "model": MODEL,
-        "temperature": 0.1,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    }
-    r = requests.post(LLM_URL, json=payload, timeout=180)
-    r.raise_for_status()
-    content = r.json()["choices"][0]["message"]["content"]
-    return json.loads(content)
+    last_err = None
+    for attempt in range(retries + 1):
+        system, temperature = base_system, 0.1
+        if attempt > 0:
+            # Perturb away from a repeated bad format and reinforce the rule.
+            system = base_system + (" Output ONLY the JSON object, nothing "
+                                    "before or after it.")
+            temperature = 0.4
+            print(f"    [~] retrying {current_name} (bad format)")
+
+        payload = {
+            "model": MODEL, "temperature": temperature,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ],
+        }
+        try:
+            r = requests.post(LLM_URL, json=payload, timeout=180)
+            r.raise_for_status()
+            content = r.json()["choices"][0]["message"]["content"]
+            obj = parse_json_lenient(content)
+            if "name" not in obj or "summary" not in obj:
+                raise ValueError(f"missing keys: {obj!r}")
+            return obj
+        except (ValueError, KeyError, json.JSONDecodeError) as e:
+            last_err = e
+            continue   # format problem — worth another generation
+    raise last_err
 
 
 def annotate(program):
