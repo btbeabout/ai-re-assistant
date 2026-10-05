@@ -140,17 +140,6 @@ def ask_llm(code, current_name, callee_ctx, strings, retries=1):
         '{"name": "<snake_case_identifier>", "summary": "<one paragraph>"}'
     )
 
-    callee_ctx, dropped_c = _budget_callees(callee_ctx)
-    strings,    dropped_s = _budget_strings(strings)
-    code,       code_cut  = _budget_code(code)
-
-    notes = []
-    if dropped_c: notes.append(f"-{dropped_c} callees")
-    if dropped_s: notes.append(f"-{dropped_s} strings")
-    if code_cut:  notes.append("code truncated")
-    if notes:
-        print(f"    [~] budget {current_name}: {', '.join(notes)}")
-
     parts = []
     if callee_ctx:
         parts.append("Functions this one calls (already analyzed):")
@@ -205,61 +194,85 @@ def annotate(program):
     decomp.openProgram(program)
 
     fm = program.getFunctionManager()
+    functions = [f for f in fm.getFunctions(True) if is_worth_analyzing(f)]
     all_funcs = list(fm.getFunctions(True))
-    functions = [f for f in all_funcs if is_worth_analyzing(f)]
-    
     skipped = len(all_funcs) - len(functions)
     print(f"[*] {len(functions)} functions to analyze, "
           f"{skipped} skipped as already-named/boilerplate")
-    
+
     functions = order_functions(functions)
     print("[*] Order (callees first): "
           + " -> ".join(str(f.getName()) for f in functions))
 
+    recovered = {}       # addr -> {"name", "summary"}; feeds callers their callees
     results = []
-    recovered = {}   # addr -> {"name", "summary"}; feeds callers their callees
+    used_names = set()   # function names already assigned in this run
+
     with pyghidra.transaction(program):
         for fn in functions:
             code = decompile(fn, decomp)
             if not code:
                 continue
 
-            # Callee summaries we've already recovered (available because the
-            # call-graph ordering processed callees before this caller).
-            callee_ctx = []
+            # Build raw context: callee summaries already recovered (available
+            # because ordering processed callees first) + referenced strings.
+            raw_callees = []
             for callee in fn.getCalledFunctions(TaskMonitor.DUMMY):
                 rec = recovered.get(str(callee.getEntryPoint()))
                 if rec:
-                    callee_ctx.append((rec["name"], rec["summary"]))
+                    raw_callees.append((rec["name"], rec["summary"]))
+            raw_strings = referenced_strings(program, fn)
 
-            strings = referenced_strings(program, fn)
+            # Budget ONCE, here, so the counts we report equal what we send.
+            callee_ctx, dropped_c = _budget_callees(raw_callees)
+            strings,    dropped_s = _budget_strings(raw_strings)
+            code_sent,  code_cut  = _budget_code(code)
 
             try:
-                ai = ask_llm(code, fn.getName(), callee_ctx, strings)
+                ai = ask_llm(code_sent, fn.getName(), callee_ctx, strings)
             except Exception as e:
                 print(f"[!] {fn.getName()}: {e}")
                 continue
 
             old = fn.getName()
+
+            # Disambiguate BEFORE assigning, so DB, propagation, and JSON all
+            # agree on the SAME unique name. A collision usually means the model
+            # produced a too-generic name; the address suffix is unique + stable.
+            name = ai["name"]
+            if name in used_names:
+                name = f"{name}_{fn.getEntryPoint()}"
+            used_names.add(name)
+
             fn.setComment(ai["summary"])
             try:
-                fn.setName(ai["name"], SourceType.USER_DEFINED)
-            except Exception:
-                pass
+                fn.setName(name, SourceType.USER_DEFINED)
+            except Exception as e:
+                print(f"    [!] rename failed for {old} -> {name}: {e}")
+                name = old   # keep JSON honest about what's actually in the DB
 
             recovered[str(fn.getEntryPoint())] = {
-                "name": ai["name"], "summary": ai["summary"]}
+                "name": name, "summary": ai["summary"]}
             results.append({
                 "address":  str(fn.getEntryPoint()),
                 "old_name": old,
-                "new_name": ai["name"],
+                "new_name": name,
                 "summary":  ai["summary"],
             })
-            extra = []
-            if callee_ctx: extra.append(f"+{len(callee_ctx)} callee ctx")
-            if strings:    extra.append(f"+{len(strings)} strings")
-            tag = f"  ({', '.join(extra)})" if extra else ""
-            print(f"[+] {old} -> {ai['name']}{tag}")
+
+            # Report what was ACTUALLY sent, plus any trimming, in one line.
+            sent = []
+            if callee_ctx: sent.append(f"{len(callee_ctx)} callees")
+            if strings:    sent.append(f"{len(strings)} strings")
+            trims = []
+            if dropped_c:  trims.append(f"-{dropped_c} callees")
+            if dropped_s:  trims.append(f"-{dropped_s} strings")
+            if code_cut:   trims.append("code cut")
+            tag = ("  sent " + ", ".join(sent)) if sent else ""
+            if trims:
+                tag += "  [budget " + ", ".join(trims) + "]"
+            print(f"[+] {old} -> {name}{tag}")
+
     return results
 
 
