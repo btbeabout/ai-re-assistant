@@ -131,7 +131,7 @@ def decompile(function, decomp):
     return None
 
 
-def ask_llm(code, current_name, callee_ctx, strings, retries=1):
+def ask_llm(code, current_name, callee_ctx, strings, retries=1, avoid_name=None):
     base_system = (
         "You are a reverse-engineering assistant. You are given decompiled C "
         "output from Ghidra, plus context about the functions it calls and the "
@@ -139,6 +139,14 @@ def ask_llm(code, current_name, callee_ctx, strings, retries=1):
         "object, no prose, no markdown fences, of the form: "
         '{"name": "<snake_case_identifier>", "summary": "<one paragraph>"}'
     )
+    if avoid_name:
+        base_system += (
+            f' NOTE: the name "{avoid_name}" is already used by another function '
+            "and is too generic. Give a DISTINCT, more specific name that "
+            "captures what makes THIS function different from others doing "
+            "similar work — name it by its specific role, data, or algorithm, "
+            "not by a generic verb like process or handle."
+        )
 
     parts = []
     if callee_ctx:
@@ -188,7 +196,6 @@ def ask_llm(code, current_name, callee_ctx, strings, retries=1):
             continue
     raise last_err
 
-
 def annotate(program):
     decomp = DecompInterface()
     decomp.openProgram(program)
@@ -204,9 +211,9 @@ def annotate(program):
     print("[*] Order (callees first): "
           + " -> ".join(str(f.getName()) for f in functions))
 
-    recovered = {}       # addr -> {"name", "summary"}; feeds callers their callees
+    recovered = {}
     results = []
-    used_names = set()   # function names already assigned in this run
+    used_names = set()
 
     with pyghidra.transaction(program):
         for fn in functions:
@@ -214,8 +221,6 @@ def annotate(program):
             if not code:
                 continue
 
-            # Build raw context: callee summaries already recovered (available
-            # because ordering processed callees first) + referenced strings.
             raw_callees = []
             for callee in fn.getCalledFunctions(TaskMonitor.DUMMY):
                 rec = recovered.get(str(callee.getEntryPoint()))
@@ -223,7 +228,6 @@ def annotate(program):
                     raw_callees.append((rec["name"], rec["summary"]))
             raw_strings = referenced_strings(program, fn)
 
-            # Budget ONCE, here, so the counts we report equal what we send.
             callee_ctx, dropped_c = _budget_callees(raw_callees)
             strings,    dropped_s = _budget_strings(raw_strings)
             code_sent,  code_cut  = _budget_code(code)
@@ -235,13 +239,25 @@ def annotate(program):
                 continue
 
             old = fn.getName()
-
-            # Disambiguate BEFORE assigning, so DB, propagation, and JSON all
-            # agree on the SAME unique name. A collision usually means the model
-            # produced a too-generic name; the address suffix is unique + stable.
             name = ai["name"]
+            reasked = False
+
+            # A collision usually means the name is too generic. Re-ask the model
+            # for a specific name (telling it what collided); only if THAT still
+            # collides do we fall back to a unique address suffix.
             if name in used_names:
-                name = f"{name}_{fn.getEntryPoint()}"
+                print(f"    [~] '{name}' taken — re-asking for a specific name")
+                try:
+                    ai = ask_llm(code_sent, fn.getName(), callee_ctx, strings,
+                                 avoid_name=name)
+                    name = ai["name"]
+                    reasked = True
+                except Exception as e:
+                    print(f"    [!] re-ask failed for {old}: {e}")
+                if name in used_names:
+                    name = f"{name}_{fn.getEntryPoint()}"
+                    print(f"    [~] still colliding — using {name}")
+
             used_names.add(name)
 
             fn.setComment(ai["summary"])
@@ -249,7 +265,7 @@ def annotate(program):
                 fn.setName(name, SourceType.USER_DEFINED)
             except Exception as e:
                 print(f"    [!] rename failed for {old} -> {name}: {e}")
-                name = old   # keep JSON honest about what's actually in the DB
+                name = old
 
             recovered[str(fn.getEntryPoint())] = {
                 "name": name, "summary": ai["summary"]}
@@ -260,7 +276,6 @@ def annotate(program):
                 "summary":  ai["summary"],
             })
 
-            # Report what was ACTUALLY sent, plus any trimming, in one line.
             sent = []
             if callee_ctx: sent.append(f"{len(callee_ctx)} callees")
             if strings:    sent.append(f"{len(strings)} strings")
@@ -269,8 +284,8 @@ def annotate(program):
             if dropped_s:  trims.append(f"-{dropped_s} strings")
             if code_cut:   trims.append("code cut")
             tag = ("  sent " + ", ".join(sent)) if sent else ""
-            if trims:
-                tag += "  [budget " + ", ".join(trims) + "]"
+            if reasked:    tag += "  [re-asked]"
+            if trims:      tag += "  [budget " + ", ".join(trims) + "]"
             print(f"[+] {old} -> {name}{tag}")
 
     return results
