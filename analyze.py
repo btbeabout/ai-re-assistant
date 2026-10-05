@@ -16,10 +16,48 @@ MODEL        = "qwen2.5-coder:14b"
 PROJECT_DIR  = os.path.expanduser("~/Desktop/AI-Malware-RE/lab/projects")
 PROJECT_NAME = "ai-re"
 
+MAX_CALLEES              = 8     # cap how many callee summaries to inject
+MAX_CALLEE_SUMMARY_CHARS = 160   # inject ~first sentence, not the whole paragraph
+MAX_STRINGS              = 12    # cap injected strings
+MAX_STRING_CHARS         = 120   # truncate any single oversized string
+MAX_CODE_CHARS           = 6000  # truncate very long decompiled bodies
+TIMEOUT_BASE             = 120   # seconds; adaptive timeout floor
+TIMEOUT_PER_1K           = 20    # +N seconds per 1000 prompt chars
+TIMEOUT_MAX              = 360   # ceiling
+
 GLUE_SYMBOLS = (
     "_ITM_deregisterTMCloneTable", "_ITM_registerTMCloneTable",
     "__cxa_finalize", "__gmon_start__",
 )
+
+def _first_sentence(text, limit):
+    text = text.strip()
+    dot = text.find(". ")
+    if 0 < dot < limit:
+        return text[:dot + 1]
+    return text[:limit].rstrip() + ("…" if len(text) > limit else "")
+
+
+def _budget_callees(callee_ctx):
+    kept = [(name, _first_sentence(summary, MAX_CALLEE_SUMMARY_CHARS))
+            for name, summary in callee_ctx[:MAX_CALLEES]]
+    return kept, len(callee_ctx) - len(kept)
+
+
+def _budget_strings(strings):
+    uniq = list(dict.fromkeys(strings))             # dedupe, keep order
+    ranked = sorted(uniq, key=len, reverse=True)    # longer == more distinctive
+    kept = [s[:MAX_STRING_CHARS] for s in ranked[:MAX_STRINGS]]
+    return kept, len(uniq) - len(kept)
+
+
+def _budget_code(code):
+    if len(code) <= MAX_CODE_CHARS:
+        return code, False
+    head = int(MAX_CODE_CHARS * 0.7)                # keep signature + early logic
+    tail = MAX_CODE_CHARS - head                    # and how it returns
+    return (code[:head] + "\n/* ... decompilation truncated ... */\n"
+            + code[-tail:]), True
 
 def parse_json_lenient(text):
     """Extract the first {...} JSON object from a model response, tolerating
@@ -102,6 +140,17 @@ def ask_llm(code, current_name, callee_ctx, strings, retries=1):
         '{"name": "<snake_case_identifier>", "summary": "<one paragraph>"}'
     )
 
+    callee_ctx, dropped_c = _budget_callees(callee_ctx)
+    strings,    dropped_s = _budget_strings(strings)
+    code,       code_cut  = _budget_code(code)
+
+    notes = []
+    if dropped_c: notes.append(f"-{dropped_c} callees")
+    if dropped_s: notes.append(f"-{dropped_s} strings")
+    if code_cut:  notes.append("code truncated")
+    if notes:
+        print(f"    [~] budget {current_name}: {', '.join(notes)}")
+
     parts = []
     if callee_ctx:
         parts.append("Functions this one calls (already analyzed):")
@@ -118,11 +167,13 @@ def ask_llm(code, current_name, callee_ctx, strings, retries=1):
     parts.append(code)
     user = "\n".join(parts)
 
+    timeout_s = min(TIMEOUT_MAX,
+                    TIMEOUT_BASE + (len(user) // 1000) * TIMEOUT_PER_1K)
+
     last_err = None
     for attempt in range(retries + 1):
         system, temperature = base_system, 0.1
         if attempt > 0:
-            # Perturb away from a repeated bad format and reinforce the rule.
             system = base_system + (" Output ONLY the JSON object, nothing "
                                     "before or after it.")
             temperature = 0.4
@@ -136,7 +187,7 @@ def ask_llm(code, current_name, callee_ctx, strings, retries=1):
             ],
         }
         try:
-            r = requests.post(LLM_URL, json=payload, timeout=180)
+            r = requests.post(LLM_URL, json=payload, timeout=timeout_s)
             r.raise_for_status()
             content = r.json()["choices"][0]["message"]["content"]
             obj = parse_json_lenient(content)
@@ -145,7 +196,7 @@ def ask_llm(code, current_name, callee_ctx, strings, retries=1):
             return obj
         except (ValueError, KeyError, json.JSONDecodeError) as e:
             last_err = e
-            continue   # format problem — worth another generation
+            continue
     raise last_err
 
 
