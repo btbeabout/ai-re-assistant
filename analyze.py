@@ -21,6 +21,9 @@ MAX_CALLEE_SUMMARY_CHARS = 160   # inject ~first sentence, not the whole paragra
 MAX_STRINGS              = 12    # cap injected strings
 MAX_STRING_CHARS         = 120   # truncate any single oversized string
 MAX_CODE_CHARS           = 6000  # truncate very long decompiled bodies
+MAX_PROFILE_IMPORTS      = 30
+MAX_PROFILE_STRINGS      = 25
+MAX_PROFILE_STRING_CHARS = 80
 TIMEOUT_BASE             = 120   # seconds; adaptive timeout floor
 TIMEOUT_PER_1K           = 20    # +N seconds per 1000 prompt chars
 TIMEOUT_MAX              = 360   # ceiling
@@ -60,6 +63,51 @@ def _budget_code(code):
     tail = MAX_CODE_CHARS - head                    # and how it returns
     return (code[:head] + "\n/* ... decompilation truncated ... */\n"
             + code[-tail:]), True
+
+def binary_profile(program):
+    """Compact whole-program context from metadata Ghidra: format,
+    imports, and notable strings. Gives every per-function prompt a shared sense
+    of what kind of program this is, so a function isn't named in a vacuum."""
+    lines = []
+
+    try:
+        lines.append(f"Format: {program.getExecutableFormat()}, "
+                     f"{program.getLanguageID()}")
+    except Exception:
+        pass
+
+    # Imported library functions: diagnostic for some binaries (network/crypto
+    # APIs reveal purpose); mostly libc for self-contained tools.
+    imports = []
+    try:
+        for f in program.getFunctionManager().getExternalFunctions():
+            imports.append(str(f.getName()))
+    except Exception:
+        pass
+    imports = sorted(set(imports))
+    if imports:
+        shown = imports[:MAX_PROFILE_IMPORTS]
+        more = f" (+{len(imports) - len(shown)} more)" if len(imports) > len(shown) else ""
+        lines.append("Imported functions: " + ", ".join(shown) + more)
+
+    # Notable strings program-wide.
+    strings = []
+    try:
+        listing = program.getListing()
+        for data in listing.getDefinedData(True):   # all defined data, forward
+            if data.hasStringValue():
+                s = str(data.getValue()).strip()
+                if len(s) >= 4:
+                    strings.append(s)
+    except Exception as e:
+        print(f"    [!] profile strings failed: {e}")
+    strings = list(dict.fromkeys(strings))
+    strings = sorted(strings, key=len, reverse=True)[:MAX_PROFILE_STRINGS]
+    if strings:
+        shown = [s[:MAX_PROFILE_STRING_CHARS] for s in strings]
+        lines.append("Notable strings: " + " | ".join(f'"{s}"' for s in shown))
+
+    return "\n".join(lines)
 
 def parse_json_lenient(text):
     """Extract the first {...} JSON object from a model response, tolerating
@@ -133,24 +181,31 @@ def decompile(function, decomp):
     return None
 
 
-def ask_llm(code, current_name, callee_ctx, strings, retries=1, avoid_name=None):
+def ask_llm(code, current_name, callee_ctx, strings, profile="",
+            retries=1, avoid_name=None):
     base_system = (
         "You are a reverse-engineering assistant. You are given decompiled C "
-        "output from Ghidra, plus context about the functions it calls and the "
-        "strings it references. Use that context. Respond with ONLY a JSON "
-        "object, no prose, no markdown fences, of the form: "
-        '{"name": "<snake_case_identifier>", "summary": "<one paragraph>"}'
+        "output from Ghidra, context about the functions it calls and the "
+        "strings it references, and a profile of the whole binary. Use ALL of "
+        "it — the program's overall purpose constrains what each function is "
+        "likely doing. Respond with ONLY a JSON object, no prose, no markdown "
+        'fences, of the form: {"name": "<snake_case_identifier>", '
+        '"summary": "<one paragraph>"}'
     )
     if avoid_name:
         base_system += (
             f' NOTE: the name "{avoid_name}" is already used by another function '
             "and is too generic. Give a DISTINCT, more specific name that "
             "captures what makes THIS function different from others doing "
-            "similar work — name it by its specific role, data, or algorithm, "
-            "not by a generic verb like process or handle."
+            "similar work — name it by its specific role, data, or algorithm."
         )
 
     parts = []
+    if profile:
+        parts.append("=== Binary context (whole program) ===")
+        parts.append(profile)
+        parts.append("=== End binary context ===")
+        parts.append("")
     if callee_ctx:
         parts.append("Functions this one calls (already analyzed):")
         for name, summary in callee_ctx:
@@ -177,7 +232,6 @@ def ask_llm(code, current_name, callee_ctx, strings, retries=1, avoid_name=None)
                                     "before or after it.")
             temperature = 0.4
             print(f"    [~] retrying {current_name} (bad format)")
-
         payload = {
             "model": MODEL, "temperature": temperature,
             "messages": [
@@ -213,6 +267,12 @@ def annotate(program):
     print("[*] Order (callees first): "
           + " -> ".join(str(f.getName()) for f in functions))
 
+    # Whole-program context, computed once and injected into every prompt so no
+    # function is named in a vacuum.
+    profile = binary_profile(program)
+    if profile:
+        print("[*] Binary profile:\n" + profile + "\n")
+
     recovered = {}
     results = []
     used_names = set()
@@ -235,7 +295,8 @@ def annotate(program):
             code_sent,  code_cut  = _budget_code(code)
 
             try:
-                ai = ask_llm(code_sent, fn.getName(), callee_ctx, strings)
+                ai = ask_llm(code_sent, fn.getName(), callee_ctx, strings,
+                             profile=profile)
             except Exception as e:
                 print(f"[!] {fn.getName()}: {e}")
                 continue
@@ -243,19 +304,15 @@ def annotate(program):
             old = fn.getName()
             name = ai["name"]
             reasked = False
-            baseline_name = None   # the generic name a collision would have kept
+            baseline_name = None
 
-            # A collision usually means the name is too generic. Re-ask the model
-            # for a specific name (telling it what collided); only if THAT still
-            # collides do we fall back to a unique address suffix. The baseline
-            # name (what we'd have used without re-ask) is recorded for A/B eval.
             if name in used_names:
                 if REASK_ON_COLLISION:
                     baseline_name = name
                     print(f"    [~] '{name}' taken — re-asking for a specific name")
                     try:
                         ai = ask_llm(code_sent, fn.getName(), callee_ctx, strings,
-                                     avoid_name=name)
+                                     profile=profile, avoid_name=name)
                         name = ai["name"]
                         reasked = True
                     except Exception as e:
