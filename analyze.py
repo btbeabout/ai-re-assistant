@@ -25,6 +25,8 @@ TIMEOUT_BASE             = 120   # seconds; adaptive timeout floor
 TIMEOUT_PER_1K           = 20    # +N seconds per 1000 prompt chars
 TIMEOUT_MAX              = 360   # ceiling
 
+REASK_ON_COLLISION = True   # False = fall straight to address suffix (A/B baseline)
+
 GLUE_SYMBOLS = (
     "_ITM_deregisterTMCloneTable", "_ITM_registerTMCloneTable",
     "__cxa_finalize", "__gmon_start__",
@@ -241,19 +243,23 @@ def annotate(program):
             old = fn.getName()
             name = ai["name"]
             reasked = False
+            baseline_name = None   # the generic name a collision would have kept
 
             # A collision usually means the name is too generic. Re-ask the model
             # for a specific name (telling it what collided); only if THAT still
-            # collides do we fall back to a unique address suffix.
+            # collides do we fall back to a unique address suffix. The baseline
+            # name (what we'd have used without re-ask) is recorded for A/B eval.
             if name in used_names:
-                print(f"    [~] '{name}' taken — re-asking for a specific name")
-                try:
-                    ai = ask_llm(code_sent, fn.getName(), callee_ctx, strings,
-                                 avoid_name=name)
-                    name = ai["name"]
-                    reasked = True
-                except Exception as e:
-                    print(f"    [!] re-ask failed for {old}: {e}")
+                if REASK_ON_COLLISION:
+                    baseline_name = name
+                    print(f"    [~] '{name}' taken — re-asking for a specific name")
+                    try:
+                        ai = ask_llm(code_sent, fn.getName(), callee_ctx, strings,
+                                     avoid_name=name)
+                        name = ai["name"]
+                        reasked = True
+                    except Exception as e:
+                        print(f"    [!] re-ask failed for {old}: {e}")
                 if name in used_names:
                     name = f"{name}_{fn.getEntryPoint()}"
                     print(f"    [~] still colliding — using {name}")
@@ -265,15 +271,17 @@ def annotate(program):
                 fn.setName(name, SourceType.USER_DEFINED)
             except Exception as e:
                 print(f"    [!] rename failed for {old} -> {name}: {e}")
-                name = old
+                name = old   # keep JSON honest about what's actually in the DB
 
             recovered[str(fn.getEntryPoint())] = {
                 "name": name, "summary": ai["summary"]}
             results.append({
-                "address":  str(fn.getEntryPoint()),
-                "old_name": old,
-                "new_name": name,
-                "summary":  ai["summary"],
+                "address":       str(fn.getEntryPoint()),
+                "old_name":      old,
+                "new_name":      name,
+                "summary":       ai["summary"],
+                "reasked":       reasked,
+                "baseline_name": baseline_name,
             })
 
             sent = []
