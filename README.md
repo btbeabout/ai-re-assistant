@@ -40,8 +40,6 @@ disambiguated so the Ghidra database and the JSON report never disagree.
 - Parses model output leniently and retries once on malformed responses.
 - Guarantees unique recovered names so the database, caller decompilation, and
   results.json stay consistent.
-- Ships an evaluation harness (see Evaluation) with lexical and LLM-judge
-  scorers.
 
 ## Validation
 
@@ -138,29 +136,33 @@ once.
 To view the annotations, open the project in the Ghidra GUI and open the binary;
 recovered names and summaries appear in the decompiler.
 
-## Evaluation
+## Evaluation experiment (archived)
 
-The harness (ground_truth.py + eval.py) measures naming quality against ground
-truth recovered from an unstripped copy of the binary (same Ghidra address frame
-as analysis, so the join is exact). It reports several scorers side by side, by
-design rather than redundancy:
+Earlier in development I built an evaluation harness (`eval.py`,
+`ground_truth.py`, `eval_reask.py`) to measure naming quality against ground
+truth recovered from an unstripped copy of a binary. It scored recovered names
+several ways — lexical token overlap, an LLM judge comparing names, an LLM judge
+comparing a name against the function's decompiled behavior — with repeated
+judgments to flag low-agreement verdicts.
 
-- Lexical (name vs name): token-set overlap. A deliberately weak baseline that
-  scores semantically-correct names like verify -> check_password as misses,
-  motivating the judges.
-- LLM judge, name vs name: a separate model (gemma3:12b, not the model that
-  wrote the names) rates whether two names mean the same thing.
-- LLM judge, name vs code: rates whether a recovered name fits the function's
-  actual decompiled behavior, which also scores conventional names like main.
-- Self-consistency: each judgment is repeated and agreement reported, flagging
-  low-agreement verdicts as untrustworthy.
+**It is archived, not part of the active pipeline.** The scripts remain in the
+repo for reference, but the tool no longer depends on them.
 
-Documented finding: the LLM judge is useful but not blindly trustworthy. Cross-
-referencing scorers surfaced systematic (not merely noisy) judge errors -- e.g.
-rewarding trivial empty functions, and scoring a good name a "miss" because the
-password semantics it captures live in the caller, not the function being
-judged. The harness's value is less a single accuracy number than this: it makes
-such errors visible instead of letting a confident wrong number stand.
+What the experiment was actually worth was the findings, not an accuracy number:
+
+- A single confident metric can be quietly wrong. Cross-referencing several
+  scorers was what exposed that, not any one of them.
+- LLM-as-judge has *systematic* (not merely noisy) failure modes here: it
+  rewarded trivial empty functions, and scored a good name a "miss" because the
+  semantics it captured lived in the caller, not the function being judged.
+  Repeating judgments caught unstable verdicts but was blind to these stable
+  biases.
+- "More specific" is not the same as "more correct" — the thing the judge
+  couldn't reliably tell apart, which is ultimately why I parked it.
+
+The robustness pieces first written for the harness — lenient JSON parsing and
+retry on malformed model output — were useful enough that they were ported into
+the main tool and remain in active use.
 
 ## Security and isolation
 
@@ -175,13 +177,14 @@ excluded by .gitignore.
 Working: full analysis pipeline -- decompile, filter, call-graph ordering,
 context enrichment, context budgeting, robust parsing, unique-name
 disambiguation, and persisted annotations -- validated on real stripped
-binaries, plus an evaluation harness with lexical and LLM-judge scorers.
+binaries.
 
 Roadmap:
 1. [done] Boilerplate filtering.
 2. [done] Call-graph-ordered analysis.
 3. [done] Context enrichment (callee summaries + referenced strings).
-4. [done] Evaluation harness (lexical + LLM-judge, with self-consistency).
+4. [archived] Evaluation harness (lexical + LLM-judge) — built, learned its
+   limits, parked; see "Evaluation experiment (archived)".
 5. [done] Robustness for real binaries: context budgeting, adaptive timeout,
    lenient parsing/retry, unique-name disambiguation.
 
