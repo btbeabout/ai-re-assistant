@@ -64,6 +64,60 @@ def _budget_code(code):
     return (code[:head] + "\n/* ... decompilation truncated ... */\n"
             + code[-tail:]), True
 
+def summarize_program(profile, results):
+    """Whole-program purpose synthesis: read the recovered per-function summaries
+    (plus the binary profile) and infer what the binary IS. Program-level claims
+    belong here, not forced onto individual functions."""
+    # Prefer the functions we actually recovered names for; skip the fun_<addr>
+    # punts and the trivial stubs, which add noise, not signal.
+    informative = [r for r in results
+                   if not r["new_name"].startswith("fun_")
+                   and r["summary"].strip()]
+    if not informative:
+        return None
+
+    lines = ["Recovered functions (name: summary):"]
+    for r in informative:
+        # One sentence each keeps the synthesis prompt bounded on big binaries.
+        s = r["summary"].strip()
+        dot = s.find(". ")
+        if 0 < dot < 200:
+            s = s[:dot + 1]
+        lines.append(f"- {r['new_name']}: {s[:200]}")
+    functions_block = "\n".join(lines)
+
+    system = (
+        "You are a reverse-engineering assistant. Given a binary's profile and "
+        "the recovered names and summaries of its functions, infer what the "
+        "program IS and does overall. Base the answer ONLY on the evidence "
+        "given; if it's ambiguous, say so rather than guessing. Respond with "
+        'ONLY a JSON object, no prose, no fences: {"purpose": "<one or two '
+        'sentences on what this binary is and does>", "category": "<short label '
+        'e.g. compression tool, network client, credential stealer>", '
+        '"confidence": "<high|medium|low>"}'
+    )
+    user = ""
+    if profile:
+        user += f"=== Binary profile ===\n{profile}\n\n"
+    user += functions_block
+
+    payload = {
+        "model": MODEL, "temperature": 0.2,
+        "messages": [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ],
+    }
+    timeout_s = min(TIMEOUT_MAX,
+                    TIMEOUT_BASE + (len(user) // 1000) * TIMEOUT_PER_1K)
+    try:
+        r = requests.post(LLM_URL, json=payload, timeout=timeout_s)
+        r.raise_for_status()
+        return parse_json_lenient(r.json()["choices"][0]["message"]["content"])
+    except Exception as e:
+        print(f"[!] program summary failed: {e}")
+        return None
+
 def binary_profile(program):
     """Compact whole-program context from metadata Ghidra: format,
     imports, and notable strings. Gives every per-function prompt a shared sense
@@ -369,6 +423,9 @@ def main(binary_path):
     in_project  = "/" + prog_name
     os.makedirs(PROJECT_DIR, exist_ok=True)
 
+    results = []
+    profile = ""
+
     with pyghidra.open_project(PROJECT_DIR, PROJECT_NAME, create=True) as project:
 
         if not program_exists(project, prog_name):
@@ -389,14 +446,23 @@ def main(binary_path):
         print("[*] Annotating...")
         with pyghidra.program_context(project, in_project) as program:
             results = annotate(program)
+            profile = binary_profile(program)      # reused for the synthesis
             program.save("AI annotations", pyghidra.task_monitor())
 
-    os.makedirs("results", exist_ok=True)
-    with open("results/results.json", "w") as f:
-        json.dump(results, f, indent=2)
+    # Whole-program purpose synthesis (reads what we just recovered).
+    summary = summarize_program(profile, results)
+    if summary:
+        print("\n" + "=" * 60)
+        print("PROGRAM PURPOSE")
+        print(f"  Category:   {summary.get('category', '?')}")
+        print(f"  Confidence: {summary.get('confidence', '?')}")
+        print(f"  Purpose:    {summary.get('purpose', '?')}")
+        print("=" * 60)
 
+    os.makedirs("results", exist_ok=True)
+    out = {"program_summary": summary, "functions": results}
     with open("results/results.json", "w") as f:
-        json.dump(results, f, indent=2)
+        json.dump(out, f, indent=2)
     print(f"\n[*] Saved {len(results)} annotations to the project and results.json")
 
 
