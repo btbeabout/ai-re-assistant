@@ -64,12 +64,9 @@ def _budget_code(code):
     return (code[:head] + "\n/* ... decompilation truncated ... */\n"
             + code[-tail:]), True
 
-def summarize_program(profile, results):
-    """Whole-program purpose synthesis: read the recovered per-function summaries
-    (plus the binary profile) and infer what the binary IS. Program-level claims
-    belong here, not forced onto individual functions."""
-    # Prefer the functions we actually recovered names for; skip the fun_<addr>
-    # punts and the trivial stubs, which add noise, not signal.
+def summarize_program(profile, results, user_context=""):
+    """Whole-program purpose synthesis from recovered summaries + profile. With
+    analyst context, reports whether the evidence supports/contradicts it."""
     informative = [r for r in results
                    if not r["new_name"].startswith("fun_")
                    and r["summary"].strip()]
@@ -78,7 +75,6 @@ def summarize_program(profile, results):
 
     lines = ["Recovered functions (name: summary):"]
     for r in informative:
-        # One sentence each keeps the synthesis prompt bounded on big binaries.
         s = r["summary"].strip()
         dot = s.find(". ")
         if 0 < dot < 200:
@@ -90,13 +86,26 @@ def summarize_program(profile, results):
         "You are a reverse-engineering assistant. Given a binary's profile and "
         "the recovered names and summaries of its functions, infer what the "
         "program IS and does overall. Base the answer ONLY on the evidence "
-        "given; if it's ambiguous, say so rather than guessing. Respond with "
-        'ONLY a JSON object, no prose, no fences: {"purpose": "<one or two '
-        'sentences on what this binary is and does>", "category": "<short label '
-        'e.g. compression tool, network client, credential stealer>", '
-        '"confidence": "<high|medium|low>"}'
+        "given; if it's ambiguous, say so rather than guessing."
     )
+    if user_context:
+        system += (
+            " The analyst believes the following about this binary (ANALYST "
+            "CONTEXT). State whether the recovered evidence SUPPORTS, PARTIALLY "
+            "supports, or CONTRADICTS that belief, and why — do not simply echo "
+            "it back."
+        )
+    system += (
+        ' Respond with ONLY a JSON object, no prose, no fences: {"purpose": '
+        '"<one or two sentences on what this binary is and does>", "category": '
+        '"<short label e.g. compression tool, network client, credential '
+        'stealer>", "confidence": "<high|medium|low>", '
+        '"matches_analyst_context": "<supports|partial|contradicts|n/a>"}'
+    )
+
     user = ""
+    if user_context:
+        user += f"=== ANALYST CONTEXT ===\n{user_context}\n\n"
     if profile:
         user += f"=== Binary profile ===\n{profile}\n\n"
     user += functions_block
@@ -236,7 +245,7 @@ def decompile(function, decomp):
 
 
 def ask_llm(code, current_name, callee_ctx, strings, profile="",
-            retries=1, avoid_name=None):
+            user_context="", retries=1, avoid_name=None):
     base_system = (
         "You are a reverse-engineering assistant. You are given decompiled C "
         "output from Ghidra, context about the functions it calls and the "
@@ -246,6 +255,15 @@ def ask_llm(code, current_name, callee_ctx, strings, profile="",
         'fences, of the form: {"name": "<snake_case_identifier>", '
         '"summary": "<one paragraph>"}'
     )
+    if user_context:
+        base_system += (
+            " The analyst has provided context about this binary (below, under "
+            "ANALYST CONTEXT). Treat it as a HYPOTHESIS to verify against the "
+            "code, NOT as fact: if the code supports it, name the function by "
+            "its specific role in that context; if the code does NOT support "
+            "it, name the function by what the code actually does and do not "
+            "force the hypothesis onto it."
+        )
     if avoid_name:
         base_system += (
             f' NOTE: the name "{avoid_name}" is already used by another function '
@@ -255,6 +273,11 @@ def ask_llm(code, current_name, callee_ctx, strings, profile="",
         )
 
     parts = []
+    if user_context:
+        parts.append("=== ANALYST CONTEXT (hypothesis to verify) ===")
+        parts.append(user_context)
+        parts.append("=== End analyst context ===")
+        parts.append("")
     if profile:
         parts.append("=== Binary context (whole program) ===")
         parts.append(profile)
@@ -306,7 +329,7 @@ def ask_llm(code, current_name, callee_ctx, strings, profile="",
             continue
     raise last_err
 
-def annotate(program):
+def annotate(program, user_context=""):
     decomp = DecompInterface()
     decomp.openProgram(program)
 
@@ -321,11 +344,11 @@ def annotate(program):
     print("[*] Order (callees first): "
           + " -> ".join(str(f.getName()) for f in functions))
 
-    # Whole-program context, computed once and injected into every prompt so no
-    # function is named in a vacuum.
     profile = binary_profile(program)
     if profile:
         print("[*] Binary profile:\n" + profile + "\n")
+    if user_context:
+        print(f"[*] Analyst context (hypothesis): {user_context}\n")
 
     recovered = {}
     results = []
@@ -350,7 +373,7 @@ def annotate(program):
 
             try:
                 ai = ask_llm(code_sent, fn.getName(), callee_ctx, strings,
-                             profile=profile)
+                             profile=profile, user_context=user_context)
             except Exception as e:
                 print(f"[!] {fn.getName()}: {e}")
                 continue
@@ -366,7 +389,8 @@ def annotate(program):
                     print(f"    [~] '{name}' taken — re-asking for a specific name")
                     try:
                         ai = ask_llm(code_sent, fn.getName(), callee_ctx, strings,
-                                     profile=profile, avoid_name=name)
+                                     profile=profile, user_context=user_context,
+                                     avoid_name=name)
                         name = ai["name"]
                         reasked = True
                     except Exception as e:
@@ -382,7 +406,7 @@ def annotate(program):
                 fn.setName(name, SourceType.USER_DEFINED)
             except Exception as e:
                 print(f"    [!] rename failed for {old} -> {name}: {e}")
-                name = old   # keep JSON honest about what's actually in the DB
+                name = old
 
             recovered[str(fn.getEntryPoint())] = {
                 "name": name, "summary": ai["summary"]}
@@ -409,6 +433,17 @@ def annotate(program):
 
     return results
 
+def delete_program(project, name):
+    """Remove a program from the project so the next run re-imports it fresh."""
+    try:
+        df = project.getProjectData().getRootFolder().getFile(name)
+        if df is not None:
+            df.delete()
+            print(f"[*] Deleted existing '{name}' from project (fresh run).")
+            return True
+    except Exception as e:
+        print(f"[!] couldn't delete '{name}': {e}")
+    return False
 
 def program_exists(project, name):
     try:
@@ -417,7 +452,7 @@ def program_exists(project, name):
         return False
 
 
-def main(binary_path):
+def main(binary_path, fresh=False, user_context=""):
     binary_path = os.path.abspath(binary_path)
     prog_name   = os.path.basename(binary_path)
     in_project  = "/" + prog_name
@@ -427,6 +462,9 @@ def main(binary_path):
     profile = ""
 
     with pyghidra.open_project(PROJECT_DIR, PROJECT_NAME, create=True) as project:
+
+        if fresh:
+            delete_program(project, prog_name)
 
         if not program_exists(project, prog_name):
             print(f"[*] Importing and analyzing {prog_name} (first run)...")
@@ -445,17 +483,18 @@ def main(binary_path):
 
         print("[*] Annotating...")
         with pyghidra.program_context(project, in_project) as program:
-            results = annotate(program)
-            profile = binary_profile(program)      # reused for the synthesis
+            results = annotate(program, user_context=user_context)
+            profile = binary_profile(program)
             program.save("AI annotations", pyghidra.task_monitor())
 
-    # Whole-program purpose synthesis (reads what we just recovered).
-    summary = summarize_program(profile, results)
+    summary = summarize_program(profile, results, user_context=user_context)
     if summary:
         print("\n" + "=" * 60)
         print("PROGRAM PURPOSE")
         print(f"  Category:   {summary.get('category', '?')}")
         print(f"  Confidence: {summary.get('confidence', '?')}")
+        if user_context:
+            print(f"  vs context: {summary.get('matches_analyst_context', '?')}")
         print(f"  Purpose:    {summary.get('purpose', '?')}")
         print("=" * 60)
 
@@ -467,7 +506,14 @@ def main(binary_path):
 
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print("Usage: python analyze.py <binary_path>")
-        sys.exit(1)
-    main(sys.argv[1])
+    import argparse
+    p = argparse.ArgumentParser(description="AI-assisted RE: name functions and "
+                                            "infer binary purpose from a stripped binary.")
+    p.add_argument("binary", help="path to the binary to analyze")
+    p.add_argument("--fresh", action="store_true",
+                   help="re-import and re-analyze even if already in the project")
+    p.add_argument("--context", default="",
+                   help="analyst hypothesis about the binary, e.g. 'CTF reversing "
+                        "challenge; find input that prints the flag'")
+    a = p.parse_args()
+    main(a.binary, fresh=a.fresh, user_context=a.context)
