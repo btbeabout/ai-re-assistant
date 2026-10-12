@@ -35,6 +35,11 @@ GLUE_SYMBOLS = (
     "__cxa_finalize", "__gmon_start__",
 )
 
+# Phrases that signal legal/boilerplate rather than program purpose.
+_BOILERPLATE = ("free software", "warranty", "gnu general public", "gpl",
+                "redistribute", "copyright", "license", "fsf.org",
+                "gnu.org/licenses", "mandatory arguments")
+
 def _first_sentence(text, limit):
     text = text.strip()
     dot = text.find(". ")
@@ -50,8 +55,8 @@ def _budget_callees(callee_ctx):
 
 
 def _budget_strings(strings):
-    uniq = list(dict.fromkeys(strings))             # dedupe, keep order
-    ranked = sorted(uniq, key=len, reverse=True)    # longer == more distinctive
+    uniq = list(dict.fromkeys(strings))
+    ranked = sorted(uniq, key=string_relevance, reverse=True)   # was: key=len
     kept = [s[:MAX_STRING_CHARS] for s in ranked[:MAX_STRINGS]]
     return kept, len(uniq) - len(kept)
 
@@ -63,6 +68,61 @@ def _budget_code(code):
     tail = MAX_CODE_CHARS - head                    # and how it returns
     return (code[:head] + "\n/* ... decompilation truncated ... */\n"
             + code[-tail:]), True
+
+def persist_summary(program, summary):
+    """Write the whole-program purpose as a comment on the entry point, so it's
+    visible when the project is reopened in the Ghidra GUI."""
+    if not summary:
+        return
+    text = (
+        "=== AI-RECOVERED PROGRAM PURPOSE ===\n"
+        f"Category:   {summary.get('category', '?')}\n"
+        f"Confidence: {summary.get('confidence', '?')}\n"
+    )
+    if summary.get("matches_analyst_context") not in (None, "n/a"):
+        text += f"vs analyst context: {summary.get('matches_analyst_context')}\n"
+    text += f"\n{summary.get('purpose', '?')}\n"
+
+    try:
+        st = program.getSymbolTable()
+        entry = None
+        # The 'entry' symbol is the conventional program entry point.
+        for sym in st.getSymbols("entry"):
+            entry = sym.getAddress()
+            break
+        if entry is None:                       # fall back to image base
+            entry = program.getImageBase()
+        listing = program.getListing()
+        # PRE_COMMENT shows above the code; survives in the saved project.
+        from ghidra.program.model.listing import CodeUnit
+        listing.setComment(entry, CodeUnit.PRE_COMMENT, text)
+        print(f"[*] Wrote program-purpose comment at {entry}")
+    except Exception as e:
+        print(f"[!] couldn't persist summary comment: {e}")
+
+def string_relevance(s):
+    """Higher = more diagnostic of program purpose. Rewards format strings,
+    error messages, paths/extensions, and option flags; penalizes legal
+    boilerplate; mild length bonus so ties favor the more informative string."""
+    low = s.lower()
+    score = 0
+    if any(b in low for b in _BOILERPLATE):
+        score -= 100                                   # bury license text
+    if "%" in s:                                       # format string
+        score += 30
+    if s.count(":") >= 2 or " -- " in s or "error" in low or "invalid" in low \
+       or "failed" in low or "cannot" in low:          # error-message shape
+        score += 25
+    if re.search(r"\.[a-z0-9]{1,4}\b", low) or "/" in s:  # extension / path
+        score += 20
+    if re.match(r"^-{1,2}[a-z]", s):                   # CLI option flag
+        score += 10
+    if any(w in low for w in ("compress", "decompress", "encrypt", "decrypt",
+                              "socket", "connect", "http", "registry", "huffman",
+                              "deflate", "inflate", "checksum", "key", "hash")):
+        score += 25                                    # domain vocabulary
+    score += min(len(s), 60) // 20                     # small length tiebreak
+    return score
 
 def summarize_program(profile, results, user_context=""):
     """Whole-program purpose synthesis from recovered summaries + profile. With
@@ -165,7 +225,7 @@ def binary_profile(program):
     except Exception as e:
         print(f"    [!] profile strings failed: {e}")
     strings = list(dict.fromkeys(strings))
-    strings = sorted(strings, key=len, reverse=True)[:MAX_PROFILE_STRINGS]
+    strings = sorted(strings, key=string_relevance, reverse=True)[:MAX_PROFILE_STRINGS]
     if strings:
         shown = [s[:MAX_PROFILE_STRING_CHARS] for s in strings]
         lines.append("Notable strings: " + " | ".join(f'"{s}"' for s in shown))
@@ -459,7 +519,7 @@ def main(binary_path, fresh=False, user_context=""):
     os.makedirs(PROJECT_DIR, exist_ok=True)
 
     results = []
-    profile = ""
+    summary = None
 
     with pyghidra.open_project(PROJECT_DIR, PROJECT_NAME, create=True) as project:
 
@@ -485,9 +545,13 @@ def main(binary_path, fresh=False, user_context=""):
         with pyghidra.program_context(project, in_project) as program:
             results = annotate(program, user_context=user_context)
             profile = binary_profile(program)
+            summary = summarize_program(profile, results,
+                                        user_context=user_context)
+            if summary:
+                with pyghidra.transaction(program):
+                    persist_summary(program, summary)
             program.save("AI annotations", pyghidra.task_monitor())
 
-    summary = summarize_program(profile, results, user_context=user_context)
     if summary:
         print("\n" + "=" * 60)
         print("PROGRAM PURPOSE")
